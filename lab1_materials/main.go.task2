@@ -1,0 +1,87 @@
+package main
+
+import (
+	"fmt"
+	"github.com/newrelic/go-agent/v3/newrelic"
+	"math/rand"
+	"net/http"
+	"os"
+	"time"
+)
+
+var (
+	app *newrelic.Application
+)
+
+func index(rw http.ResponseWriter, req *http.Request) {
+	txn := app.StartTransaction("index")
+	defer txn.End()
+
+	//以下の2行を追加
+	txn.SetWebRequestHTTP(req)
+	rw = txn.SetWebResponse(rw)
+
+	time.Sleep(15 * time.Millisecond)
+	rw.Write([]byte("Hello World"))
+}
+
+func hoge(rw http.ResponseWriter, req *http.Request) {
+	//以下2行を追加
+	txn := app.StartTransaction("hoge")
+	defer txn.End()
+
+	func() {
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	rw.Write([]byte("hoge"))
+}
+
+func external(rw http.ResponseWriter, r *http.Request) {
+	//以下2行を追加
+	txn := app.StartTransaction("external")
+	defer txn.End()
+
+	rw.Write([]byte("外部呼び出し"))
+
+	rand.Seed(time.Now().UnixNano())
+	url := "http://example.com"
+	if (rand.Intn(2) == 0) {
+		url = "http://example.invalid"
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		rw.Write([]byte(fmt.Sprintf("リクエスト作成失敗: %v", err)))
+		return
+	}
+
+	client := http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		rw.Write([]byte(fmt.Sprintf("リクエスト実行失敗: %v", err)))
+		return
+	}
+	resp.Body.Close()
+	rw.Write([]byte(fmt.Sprintf("呼び出しステータス: %v", resp.Status)))
+}
+
+func main() {
+	var err error
+	app, err = newrelic.NewApplication(
+		newrelic.ConfigAppName("lab1"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDebugLogger(os.Stdout),
+	)
+
+	if (err != nil) {
+		panic(err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", index)
+	mux.HandleFunc("/hoge", hoge)
+	mux.HandleFunc("/external", external)
+
+	http.ListenAndServe(":8123", mux)
+}

@@ -1,0 +1,100 @@
+package main
+
+import (
+	"fmt"
+	"github.com/newrelic/go-agent/v3/newrelic"
+	"math/rand"
+	"net/http"
+	"os"
+	"time"
+)
+
+var (
+	app *newrelic.Application
+	client = &http.Client{
+		Transport: newrelic.NewRoundTripper(nil),
+	}
+)
+
+func index (rw http.ResponseWriter, req *http.Request) {
+	txn := newrelic.FromContext(req.Context())
+	txn.AddAttribute("customerLevel", req.URL.Query().Get("customerLevel"))
+
+	time.Sleep(15 * time.Millisecond)
+	rw.Write([]byte("Hello World"))
+}
+
+func hoge(rw http.ResponseWriter, req *http.Request) {
+	rw.Write([]byte("hoge"))
+
+	txn := newrelic.FromContext(req.Context())
+	txn.AddAttribute("customerLevel", req.URL.Query().Get("customerLevel"))
+
+	func() {
+		defer txn.StartSegment("segment1").End()
+		time.Sleep(10 * time.Millisecond)
+	}()
+
+	s2 := txn.StartSegment("segment2")
+	time.Sleep(15 * time.Millisecond)
+	s2.End()
+}
+
+func external(rw http.ResponseWriter, r *http.Request) {
+	rw.Write([]byte("外部呼び出し"))
+
+	txn := newrelic.FromContext(r.Context())
+
+	rand.Seed(time.Now().UnixNano())
+	url := "http://example.com"
+	if (rand.Intn(2) == 0) {
+		url = "http://example.invalid"
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if (err != nil) {
+		txn.NoticeError(err)
+		rw.Write([]byte(fmt.Sprintf("リクエスト作成失敗: %v", err)))
+		return
+	}
+
+	//client := http.Client{}
+	req = req.WithContext(r.Context())
+	resp, err := client.Do(req)
+	if (err != nil) {
+		txn.NoticeError(err)
+		rw.Write([]byte(fmt.Sprintf("リクエスト実行失敗: %v", err)))
+		return
+	}
+	resp.Body.Close()
+	rw.Write([]byte(fmt.Sprintf("呼び出しステータス: %v", resp.Status)))
+
+}
+
+type replacementMux struct {
+	app *newrelic.Application
+	*http.ServeMux
+}
+
+func (mux *replacementMux) HandleFunc(pattern string, fn func(http.ResponseWriter, *http.Request)) {
+	mux.ServeMux.HandleFunc(newrelic.WrapHandleFunc(mux.app, pattern, fn))
+}
+
+func main() {
+	var err error
+	app, err = newrelic.NewApplication(
+		newrelic.ConfigAppName("lab1"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDebugLogger(os.Stdout),
+	)
+
+	if (err != nil) {
+		panic(err)
+	}
+
+	mux := replacementMux{ServeMux: http.NewServeMux(), app: app}
+	mux.HandleFunc("/", index)
+	mux.HandleFunc("/hoge", hoge)
+	mux.HandleFunc("/external", external)
+
+	http.ListenAndServe(":8123", mux)
+}

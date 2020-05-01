@@ -1,0 +1,65 @@
+package main
+
+import (
+	"fmt"
+	"github.com/newrelic/go-agent/v3/newrelic"
+	"math/rand"
+	"net/http"
+	"os"
+	"time"
+)
+
+func index(rw http.ResponseWriter, req *http.Request) {
+	time.Sleep(15 * time.Millisecond)
+	rw.Write([]byte("Hello World"))
+}
+
+func hoge(rw http.ResponseWriter, req *http.Request) {
+	func() {
+		time.Sleep(100 * time.Millisecond)
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	rw.Write([]byte("hoge"))
+}
+
+func external(rw http.ResponseWriter, r *http.Request) {
+	rw.Write([]byte("外部呼び出し"))
+
+	rand.Seed(time.Now().UnixNano())
+	url := "http://example.com"
+	if (rand.Intn(2) == 0) {
+		url = "http://example.invalid"
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		rw.Write([]byte(fmt.Sprintf("リクエスト作成失敗: %v", err)))
+		return
+	}
+
+	client := http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		rw.Write([]byte(fmt.Sprintf("リクエスト実行失敗: %v", err)))
+		return
+	}
+	resp.Body.Close()
+	rw.Write([]byte(fmt.Sprintf("呼び出しステータス: %v", resp.Status)))
+}
+
+func main() {
+	newrelic.NewApplication(
+		newrelic.ConfigAppName("lab1"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		func (cfg *newrelic.Config){
+			//
+		},
+	)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", index)
+	mux.HandleFunc("/hoge", hoge)
+	mux.HandleFunc("/external", external)
+
+	http.ListenAndServe(":8123", mux)
+}
