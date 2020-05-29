@@ -49,9 +49,9 @@ pdf_options:
   - [segmentsの導入](#segmentsの導入)
   - [外部呼び出し](#外部呼び出し)
 - [発展編](#発展編)
-  - [ログ出力](#ログ出力)
-  - [Logs in Context](#logs-in-context)
-  - [エージェントのログをIntegrationで出力する](#エージェントのログをintegrationで出力する)
+  - [goroutineの計測](#goroutineの計測)
+  - [Integrationの利用](#integrationの利用)
+  - [ハンズオン](#ハンズオン)
 - [リンク](#リンク)
 
 <!-- /code_chunk_output -->
@@ -574,13 +574,83 @@ var (
 
 ## 発展編
 
+発展編は2つのWebアプリからなるプロジェクトに所定の計測をセットアップするハンズオンです。ハンズオンに進む前にgoroutingの計測とIntegrationの利用方法を確認します。
 
-### ログ出力
+### goroutineの計測
 
-### Logs in Context
+次のコードのような非同期処理されている部分を、トランザクションのセグメントとして計測したいケースを考えます。
 
-### エージェントのログをIntegrationで出力する
+```
+func async(rw http.ResponseWriter, req *http.Request) {
+	wg := &sync.WaitGroup{}
+	numTaks := 5
+	for i := 0; i < numTaks; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			time.Sleep(20 * time.Millisecond)
+		}()
+	}
 
+	wg.Wait()
+	rw.Write([]byte("async work complete"))
+}
+```
+
+この場合、goroutineで呼び出されるメソッド`func`の中でセグメントを作りますが、呼び出し元のトランザクションそのものではなく、`NewGoroutine`メソッドで生成したトランザクションからセグメントを作ります。そのため、goroutineのメソッド引数として渡すようにします。
+
+```
+func async(rw http.ResponseWriter, req *http.Request) {
+	txn := newrelic.FromContext(req.Context())
+	wg := &sync.WaitGroup{}
+	numTaks := 5
+	for i := 0; i < numTaks; i++ {
+		wg.Add(1)
+		go func(idx int, txn *newrelic.Transaction) {
+			defer wg.Done()
+			defer txn.StartSegment("segment-"+strconv.Itoa(idx)).End()
+			time.Sleep(20 * time.Millisecond)
+		}(i, txn.NewGoroutine())
+	}
+
+	wg.Wait()
+	rw.Write([]byte("async work complete"))
+}
+```
+
+正しく計測できるとこのように表示されます。
+
+![](./images/lab2/01.png)
+
+ここでresponse timeが全体の経過時間よりかなり短くなっていますが、これについては後で説明します。トランザクション詳細を確認してみます。
+
+![](./images/lab2/02.png)
+
+goroutineで呼び出された`segement-1`から5が1つのトランザクションの中に見えていることがわかります。これで非同期処理部分も一つのトランザクションの中に表示することができました。ここで注意しないといけないのは非同期処理した部分のdurationの総計がトランザクションのdurationに等しいわけではない、ということです。この`segement-1`から5の処理は並列に実行されたため、トランザクションとしての経過時間はその合計よりも短くなることが期待されます。実際にトランザクション詳細のresponse timeは23msecと表示されています。したがって、`segement-1`から5はほぼ同時に並列処理されたと考えることができます。これが、先ほどのスループットのグラフでresponse timeが全体の経過時間より短くなっている理由です。逆にいえば、スループットのグラフでこのような状況になっていると、非同期処理が行われていると推定できます。
+
+### Integrationの利用
+
+基礎編ではsegmentを手動で挿入することでトランザクションの中の処理を細分化しました。おそらく、データベースなどのミドルウェアの呼び出しをこの方法を使って細分化したくなるでしょう。さらに、例えばデータベースの場合には、発行しているクエリを追加の属性として追加したくなります。もちろん手動でsegmentを作ることでも実現できますが、Integrationを利用することでより簡単なコードで楽にsegmentの追加が可能になります。利用可能なIntegrationは[GitHub](https://github.com/newrelic/go-agent#integrations)に一覧があります。
+
+それぞれのIntegrationの利用方法はリンク先のGoDocに説明されています。例えば[gRPC](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrgrpc)などです。また、動く状態でのexampleコードがGitHubのv3/integration/.../eampleにあります。例えば[MySQL(nrmysqlドライバ)](https://github.com/newrelic/go-agent/blob/master/v3/integrations/nrmysql/example/main.go)などです。
+
+ハンズオン課題はIntegrationを活用しますので、適宜これらの情報を参照してください。
+
+### ハンズオン
+
+TBD
+
+ハンズオンで利用するIntegrationは次のものです。
+
+- gRPC
+- nrmysql
+- sqlx
+- nrlogrus + Logs In Context
+
+また以下の追加テーマがあります。
+
+- エージェントのログをIntegration経由で出力する
+- 分散トレーシングの活用
 
 ## リンク
 
@@ -594,3 +664,4 @@ var (
 - [Go Agent v3 App Examples](https://github.com/newrelic/go-agent/tree/master/v3/examples)
 - [Go Agent v3 Technical Documentation](https://godoc.org/github.com/newrelic/go-agent/v3/newrelic)
 - [Migration Guide to v3](https://github.com/newrelic/go-agent/blob/master/MIGRATION.md)
+- [GO Agent v3 Migration](https://github.com/newrelic/go-agent/blob/master/MIGRATION.md)
