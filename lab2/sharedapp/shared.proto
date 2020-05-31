@@ -1,0 +1,17 @@
+syntax = "proto3";
+option go_package = "";
+
+
+service CouponApplication {
+    rpc Validate(Coupon) returns (CouponResult) {}
+}
+
+message Coupon {
+    string id = 1;
+}
+
+message CouponResult {
+    bool isValid = 1;
+    int64 amount = 2;
+    string message = 3;
+}

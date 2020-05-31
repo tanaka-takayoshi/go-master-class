@@ -638,19 +638,188 @@ goroutineで呼び出された`segement-1`から5が1つのトランザクショ
 
 ### ハンズオン
 
-TBD
+#### 課題
 
-ハンズオンで利用するIntegrationは次のものです。
+lab2フォルダの下に2つのgo アプリケーションとMySQLからなるサービスを用意しています。webportalに対してHTTPリクエストを投げると、webportalからcouponserviceにgRPCでリクエストが投げられ、couponserviceがMySQLに接続する構成になっています。
 
-- gRPC
-- nrmysql
-- sqlx
-- nrlogrus + Logs In Context
+起動はdocker-compose経由で行います。[docker-compose.yml](./lab2/docker-compose.yml)の中にある２箇所の`<replace_with_licensekey>`をライセンスキーに置き換えてください。
 
-また以下の追加テーマがあります。
+```
+docker-compose build
+docker-compose up
+```
 
-- エージェントのログをIntegration経由で出力する
-- 分散トレーシングの活用
+goのコードを編集した後はbuildする必要はなく、`docker-compose up`を再度起動してください。
+
+webportalには2つのエンドポイントがあります。
+
+- [http://127.0.0.1:8000/async](http://127.0.0.1:8000/async) 非同期処理
+- [http://127.0.0.1:8000/order?id=nnn](http://127.0.0.1:8000/order?id=nnn) クーポンのチェックをcouponserviceに投げてその結果を返す処理
+  - 存在するクーポンIDと値引額は[02_insert_coupons.sql](./lab2/mysql/init/02_insert_coupons.sql)に記載されてます
+
+このアプリに対して、New Relic go Agentを適用して以下の計測を行ってください。
+
+1. [基礎編](#基礎編)を見て2つのアプリケーションをgo agentを適用する。このとき、分散トレーシングを有効にする。
+2. [nrgorilla](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrgorilla) Integrationを使ってwebportalの2つのエンドポイントをトランザクションとして見られるようにする
+3. [goroutineの計測](#goroutineの計測)を見て、asyncエンドポイントで非同期処理をsegmentとして計測できるようにする
+4. [nrgRPC](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrgrpc) Integrationを使ってgRPC接続を計測し、分散トレーシングでつながって見えるようにする
+5. [nrmysql](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrmysql)とsqlxを使ってcouponserviceのデータベース呼び出しを計測する。
+6. [nrlogrus](https://godoc.org/github.com/newrelic/go-agent/v3/integrations/nrlogrus)を使ってAgentのログをlogrus経由で出力する
+7. [Logs in Context](https://docs.newrelic.com/docs/logs/enable-logs/logs-context-go/configure-logs-context-go)を適用して、既存のログ出力部分をLogs in Contextで連携するようにする。（New Relic Logsへの転送までは行わず、標準出力にJSON形式でログが出ればOKとします)
+
+#### 解説
+
+完成形は[couponservice](./lab2_final/couponservice/main.go)と[webportal](./lab2_final/webportal/main.go)にあります。
+うまく計測できているとwebportalはこのように青と緑（gRPC呼び出し部分）が見えます。
+
+![](./images/lab2/11.png)
+
+orderトランザクションの内訳は外部呼び出し先の情報が見えます。
+
+![](./images/lab2/12.png)
+
+asyncトランザクションは非同期処理がsegmentとして見えます。
+
+![](./images/lab2/13.png)
+
+couponserviceは青と黄色（DB呼び出し部分）が見えます。
+
+![](./images/lab2/14.png)
+
+Validateトランザクションの内訳ではDBクエリの詳細が見えます。
+
+![](./images/lab2/15.png)
+
+分散トレーシング画面では、webportal->couponservice->MySQLの繋がりが見えます。
+
+![](./images/lab2/16.png)
+
+
+##### go agentの適用
+
+両者のmain.go関数に次のような初期化処理を入れてください。`newrelic.ConfigDistributedTracerEnabled(true)`で分散トレーシングを有効にします。
+
+```
+	app, err := newrelic.NewApplication(
+		newrelic.ConfigAppName("lab2 webportal"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDistributedTracerEnabled(true),
+	)
+	if err != nil {
+		log.Panic(err)
+	}
+```
+
+##### nrgorilla
+
+以下のように`r.Use(nrgorilla.Middleware(app))`の1行を追加すればOKです。このようにIntegrationが提供されているミドルウェアの場合、go Agentの適用が簡単にできるようになっています。
+
+```
+	r := mux.NewRouter()
+	r.Use(nrgorilla.Middleware(app))
+
+	r.HandleFunc("/async", async)
+	r.HandleFunc("/order", order)
+
+	http.ListenAndServe(":8000", r)
+```
+
+##### asyncエンドポイント
+
+[goroutineの計測](#goroutineの計測)そのままなので省略。
+
+##### gRPC
+
+gRPCのクライアント側(webportal)はgRPC接続の初期化でパラメーターを追加します。
+
+```
+	conn, err := grpc.Dial(
+		coupon_url,
+		grpc.WithInsecure(),
+		// Add the New Relic gRPC client instrumentation
+		grpc.WithUnaryInterceptor(nrgrpc.UnaryClientInterceptor),
+		grpc.WithStreamInterceptor(nrgrpc.StreamClientInterceptor),
+	)
+```
+
+gRPCのサーバー側(couponservice)はgRPCサーバーの作成時のパラーメーターを追加します。
+
+```
+	grpcServer := grpc.NewServer(
+		// Add the New Relic gRPC server instrumentation
+		grpc.UnaryInterceptor(nrgrpc.UnaryServerInterceptor(app)),
+		grpc.StreamInterceptor(nrgrpc.StreamServerInterceptor(app)),
+	)
+```
+
+さらに、`order`メソッドの最初でセグメントを生成します。
+
+```
+defer newrelic.FromContext(ctx).StartSegment("validate").End()
+```
+
+##### DB接続
+
+import文を変更して、mysqlドライバをnrmysqlドライバに変更します。
+
+```
+import (
+	_ "github.com/newrelic/go-agent/v3/integrations/nrmysql"
+)
+```
+
+sqlxを使って呼び出す部分で、`XXX`メソッドの代わりに`XXXContext`メソッドを呼び出して第一引数に`context`を渡す必要がありますが、今回はすでにそうなっているので変更する必要はありません。
+
+```
+err := dbx.GetContext(ctx, &couponDiscount, query, coupon.Id)
+```
+
+##### Agentのログをnrlogrus経由でlogrusに出力する
+
+New Relic Agentの初期化で`nrlogrus.ConfigStandardLogger()`をパラメーターに追加します。
+
+```
+	app, err := newrelic.NewApplication(
+		newrelic.ConfigAppName("lab2 couponservice"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDistributedTracerEnabled(true),
+		nrlogrus.ConfigStandardLogger(),
+	)
+```
+
+##### Logs in Context
+
+main関数の最初でlogrusの設定を行う場所に、`SetFormatter`を追加します。
+
+```
+log = logrus.New()
+log.SetFormatter(nrlogrusplugin.ContextFormatter{})
+```
+
+さらに、トランザクションの中（webportalのasyncメソッドとorderメソッドcouponserviceのValidateメソッド）でログを出力する場合は、contextを渡して`log.WithContet`でLogEntryを取得します。この後のログ出力はこのLogEntry経由で行います。
+
+```
+e := log.WithContext(req.Context())
+//もしくは
+e := log.WithContext(ctx)
+```
+
+例えばこうなります。
+
+```
+e.Infof("coupon利用 ID= %s", couponId)
+```
+
+ログ形式がJSONになり、trace.idやspan.idなどが含まれていれば動作しています。
+
+```
+couponservice_1  | {"trace.id":"c696da1157fc44024a6d09de63faa338","span.id":"544a52112622d5ce","entity.type":"SERVICE","timestamp":1590911218815,"log.level":"debug","entity.name":"lab2 couponservice","entity.guid":"MjY5NjY2M3xBUE18QVBQTElDQVRJT058NTM3NTM5NjI4","hostname":"1465b1778e5a","message":"coupon情報を取得 ID=XYZ100"}
+webapp_1         | {"span.id":"91b893f0d032bf05","entity.guid":"MjY5NjY2M3xBUE18QVBQTElDQVRJT058NTM3NTM4ODUz","hostname":"f33224566b19","timestamp":1590911218831,"log.level":"info","trace.id":"c696da1157fc44024a6d09de63faa338","entity.name":"lab2 webportal","entity.type":"SERVICE","message":"coupon利用 ID= XYZ100"}
+couponservice_1  | {"log.level":"debug","span.id":"e1a8f5e07f50636d","entity.name":"lab2 couponservice","entity.type":"SERVICE","entity.guid":"MjY5NjY2M3xBUE18QVBQTElDQVRJT058NTM3NTM5NjI4","hostname":"1465b1778e5a","timestamp":1590911220963,"message":"coupon情報を取得 ID=XYZ10sss0","trace.id":"a7f5d01da4cb2378cda34e1d5bde1fad"}
+webapp_1         | {"entity.guid":"MjY5NjY2M3xBUE18QVBQTElDQVRJT058NTM3NTM4ODUz","hostname":"f33224566b19","timestamp":1590911220965,"trace.id":"a7f5d01da4cb2378cda34e1d5bde1fad","span.id":"665db8ef1a3687ff","entity.name":"lab2 webportal","entity.type":"SERVICE","message":"coupon利用 ID= XYZ10sss0","log.level":"info"}
+```
+
+実際にLogs in Contextを使う場合はこのログをfluentd pluginなどでNew Relic Logsに転送する必要があります。
 
 ## リンク
 

@@ -1,0 +1,45 @@
+version: '3'
+
+services:
+
+  webapp:
+    build: ./webportal
+    volumes:
+      - ./webportal:/go/src/webapp
+      - ./sharedapp:/go/src/sharedapp
+    env_file:
+      - ".env"
+    environment:
+      - "NEW_RELIC_LICENSE_KEY=<replace_with_licensekey>"
+      - "COUPON_SVC_URL=couponservice:8001"
+    links:
+      - couponservice
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  couponservice:
+    build: ./couponservice
+    volumes:
+      - ./couponservice:/go/src/webapp
+      - ./sharedapp:/go/src/sharedapp
+    env_file:
+      - ".env"
+    environment:
+      - "NEW_RELIC_LICENSE_KEY=<replace_with_licensekey>"
+    ports:
+      - "127.0.0.1:8001:8001"
+
+  mysql:
+    image: mysql:8
+    command: mysqld --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    environment:
+      - "TZ=Asia/Tokyo"
+    env_file:
+      - ".env"
+    volumes:
+      - ./mysql/data:/var/lib/mysql
+      - ./mysql/init:/docker-entrypoint-initdb.d
+      - ./mysql/conf.d:/etc/mysql/conf.d
+
+volumes:
+  mysql:
